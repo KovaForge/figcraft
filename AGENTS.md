@@ -169,6 +169,15 @@ Linux canonical root is `/home/mike/Work`.
   `upstream` = `https://github.com/storytold/figcraft.git`,
   `vladislava` = `git@github-vladislava:KovaForge/figcraft.git`
 
+### Agent wrapper (KovaForge-only)
+
+`apps/figcraft-cli/figcraft-agent` is a bash wrapper that exposes the
+headless CLI surface (`render`, `export`, `info`, `commands`, `mcp-start`,
+`mcp-attach`, `mcp-stop`) with structured JSON output. It calls the same
+upstream `figcraft-cli` binary without changing any crate, so upstream
+syncing stays a fast-forward. See
+`apps/figcraft-cli/figcraft-agent.README.md`.
+
 ### Secrets
 
 Never commit `.env`, `*.env`, `secrets.json`, or `credentials.*`.

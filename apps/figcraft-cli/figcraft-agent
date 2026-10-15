@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# figcraft-agent — KovaForge agent-facing wrapper around figcraft-cli.
+#
+# This file lives in the KovaForge fork and is NOT upstream. The clean-room
+# rule (AGENTS.md, "Non-negotiables") covers the Rust crates. A bash wrapper
+# alongside the CLI is fine: it adds an agent-friendly surface without changing
+# any crate, so upstream syncing stays a fast-forward.
+#
+# Conventions for agents:
+#   * stdout is structured (one JSON object per line) for machine consumption
+#   * file paths are absolute; no relative resolution against cwd
+#   * render output goes to FIGCRAFT_OUT (default: $XDG_PICTURES_HOME/figcraft)
+#   * MCP lifecycle: mcp-start (headless) and mcp-attach (running app)
+#
+# Agents should treat non-zero exits as blocking failures and stop the chain
+# rather than retry. The wrapper never modifies the input .figcraft; reads only.
+
+set -euo pipefail
+
+# Resolve the workspace binary. cargo build --release -p figcraft-cli produces
+# target/release/figcraft-cli. We prefer a release binary if present, fall back
+# to a debug build, and as a last resort the source tree's xtask-launched one.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+resolve_cli() {
+  for cand in \
+    "$WORKSPACE_ROOT/target/release/figcraft-cli" \
+    "$WORKSPACE_ROOT/target/debug/figcraft-cli"; do
+    if [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  if command -v figcraft-cli >/dev/null 2>&1; then
+    command -v figcraft-cli
+    return 0
+  fi
+  echo "figcraft-agent: figcraft-cli binary not found; run 'cargo build --release -p figcraft-cli'" >&2
+  return 127
+}
+
+FIGCRAFT_CLI="$(resolve_cli)"
+FIGCRAFT_OUT="${FIGCRAFT_OUT:-$HOME/Pictures/figcraft}"
+
+# Emit one JSON line on stdout. Errors go to stderr.
+emit() {
+  printf '%s\n' "$1"
+}
+
+err() {
+  printf 'figcraft-agent: %s\n' "$1" >&2
+}
+
+# Argv: one path
+require_abs() {
+  case "$1" in
+    /*) ;;
+    *) err "expected absolute path, got: $1"; return 2 ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+figcraft-agent <subcommand> [args...]
+
+  render <file.figcraft> [-o out.png] [--scale N]
+        Render the file to PNG. Default scale 2 (KovaForge export default).
+        Output: $FIGCRAFT_OUT (default $HOME/Pictures/figcraft).
+
+  export <file.figcraft> --format svg|pdf|webp|jpg [--out-dir DIR]
+        Export layers in the chosen format. Default out-dir $FIGCRAFT_OUT.
+
+  info <file.figcraft>
+        Print one-line JSON summary: pages, frames, components, lastSavedBy.
+
+  commands [--filter REGEX]
+        List the full command registry (or filter by regex). For agent planning.
+
+  mcp-start [--bind 127.0.0.1:47800]
+        Start the figcraft-cli MCP server in the background. Writes
+        .figcraft-agent/mcp-{pid,port} under $FIGCRAFT_OUT/agent-state/.
+        Returns one JSON line with the port.
+
+  mcp-attach <port>
+        Verify a running figcraft app's MCP port is reachable. Returns
+        one JSON line { ok: bool, port: int, reason: string? }.
+
+  mcp-stop
+        Stop the background MCP server started by mcp-start.
+
+Environment:
+  FIGCRAFT_OUT   Output directory (default $HOME/Pictures/figcraft)
+  CARGO_TARGET_DIR  Override the cargo target dir if you build per-agent.
+EOF
+}
+
+cmd_render() {
+  [[ $# -ge 1 ]] || { err "render: missing <file.figcraft>"; return 2; }
+  local input="$1"; shift
+  require_abs "$input" || return 2
+  [[ -f "$input" ]] || { err "render: file not found: $input"; return 2; }
+
+  local scale=2
+  local out=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--out) out="$2"; shift 2 ;;
+      --scale)  scale="$2"; shift 2 ;;
+      *) err "render: unknown arg: $1"; return 2 ;;
+    esac
+  done
+
+  if [[ -z "$out" ]]; then
+    mkdir -p "$FIGCRAFT_OUT"
+    local base
+    base="$(basename "$input" .figcraft)"
+    out="$FIGCRAFT_OUT/${base}-2x.png"
+  fi
+  mkdir -p "$(dirname "$out")"
+
+  "$FIGCRAFT_CLI" render "$input" -o "$out" --scale "$scale"
+  emit "{\"ok\":true,\"input\":\"$input\",\"output\":\"$out\",\"scale\":$scale}"
+}
+
+cmd_export() {
+  [[ $# -ge 1 ]] || { err "export: missing <file.figcraft>"; return 2; }
+  local input="$1"; shift
+  require_abs "$input" || return 2
+  [[ -f "$input" ]] || { err "export: file not found: $input"; return 2; }
+
+  local fmt="" out_dir="$FIGCRAFT_OUT"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format)  fmt="$2"; shift 2 ;;
+      --out-dir) out_dir="$2"; shift 2 ;;
+      *) err "export: unknown arg: $1"; return 2 ;;
+    esac
+  done
+  [[ -n "$fmt" ]] || { err "export: --format required (svg|pdf|webp|jpg)"; return 2; }
+
+  mkdir -p "$out_dir"
+  "$FIGCRAFT_CLI" export "$input" -o "$out_dir/" --format "$fmt"
+  emit "{\"ok\":true,\"input\":\"$input\",\"outDir\":\"$out_dir\",\"format\":\"$fmt\"}"
+}
+
+cmd_info() {
+  [[ $# -ge 1 ]] || { err "info: missing <file.figcraft>"; return 2; }
+  local input="$1"; shift
+  require_abs "$input" || return 2
+  [[ -f "$input" ]] || { err "info: file not found: $input"; return 2; }
+  # figcraft-cli has no `info` subcommand in 0.6.0; emit the raw output and let
+  # the caller parse. Keeps the wrapper forward-compatible.
+  "$FIGCRAFT_CLI" info "$input" 2>&1 || true
+}
+
+cmd_commands() {
+  local filter=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filter) filter="$2"; shift 2 ;;
+      *) err "commands: unknown arg: $1"; return 2 ;;
+    esac
+  done
+  if [[ -n "$filter" ]]; then
+    "$FIGCRAFT_CLI" commands --filter "$filter"
+  else
+    "$FIGCRAFT_CLI" commands
+  fi
+}
+
+# MCP lifecycle state lives under $FIGCRAFT_OUT/agent-state/.
+agent_state_dir() {
+  printf '%s/agent-state' "$FIGCRAFT_OUT"
+}
+
+cmd_mcp_start() {
+  local bind="127.0.0.1:47800"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bind) bind="$2"; shift 2 ;;
+      *) err "mcp-start: unknown arg: $1"; return 2 ;;
+    esac
+  done
+
+  local state; state="$(agent_state_dir)"
+  mkdir -p "$state"
+
+  # Reuse an already-running MCP server if the pid file is live.
+  if [[ -f "$state/mcp-pid" ]]; then
+    local pid; pid="$(cat "$state/mcp-pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      local port; port="$(cat "$state/mcp-port" 2>/dev/null || echo "$bind")"
+      emit "{\"ok\":true,\"reused\":true,\"pid\":$pid,\"port\":\"$port\"}"
+      return 0
+    fi
+  fi
+
+  # Headless MCP. figcraft-cli 0.6.0: `figcraft-cli mcp` runs in the foreground
+  # over stdio by default. We background it and capture the port from --bind.
+  local log="$state/mcp.log"
+  : > "$log"
+  nohup "$FIGCRAFT_CLI" mcp --bind "$bind" >>"$log" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$state/mcp-pid"
+  echo "$bind" > "$state/mcp-port"
+
+  # Best-effort liveness probe: give the server a moment, then check the pid.
+  sleep 0.3
+  if ! kill -0 "$pid" 2>/dev/null; then
+    err "mcp-start: server exited; see $log"
+    return 1
+  fi
+  emit "{\"ok\":true,\"reused\":false,\"pid\":$pid,\"bind\":\"$bind\",\"log\":\"$log\"}"
+}
+
+cmd_mcp_attach() {
+  [[ $# -ge 1 ]] || { err "mcp-attach: missing <port>"; return 2; }
+  local port="$1"; shift
+  # TCP connect probe; cheap and doesn't need the CLI binary.
+  if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+    emit "{\"ok\":true,\"port\":$port}"
+  else
+    emit "{\"ok\":false,\"port\":$port,\"reason\":\"connect failed\"}"
+    return 1
+  fi
+}
+
+cmd_mcp_stop() {
+  local state; state="$(agent_state_dir)"
+  [[ -f "$state/mcp-pid" ]] || { emit "{\"ok\":true,\"stopped\":false,\"reason\":\"no pid file\"}"; return 0; }
+  local pid; pid="$(cat "$state/mcp-pid" 2>/dev/null || true)"
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$state/mcp-pid" "$state/mcp-port"
+    emit "{\"ok\":true,\"stopped\":false,\"reason\":\"not running\"}"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  sleep 0.2
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  rm -f "$state/mcp-pid" "$state/mcp-port"
+  emit "{\"ok\":true,\"stopped\":true,\"pid\":$pid}"
+}
+
+main() {
+  [[ $# -ge 1 ]] || { usage; return 2; }
+  local sub="$1"; shift
+  case "$sub" in
+    render)    cmd_render "$@" ;;
+    export)    cmd_export "$@" ;;
+    info)      cmd_info "$@" ;;
+    commands)  cmd_commands "$@" ;;
+    mcp-start) cmd_mcp_start "$@" ;;
+    mcp-attach) cmd_mcp_attach "$@" ;;
+    mcp-stop)  cmd_mcp_stop "$@" ;;
+    -h|--help|help) usage ;;
+    *) err "unknown subcommand: $sub"; usage; return 2 ;;
+  esac
+}
+
+main "$@"
