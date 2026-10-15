@@ -20,7 +20,11 @@ set -euo pipefail
 # Resolve the workspace binary. cargo build --release -p figcraft-cli produces
 # target/release/figcraft-cli. We prefer a release binary if present, fall back
 # to a debug build, and as a last resort the source tree's xtask-launched one.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the real path: when invoked through a symlink (e.g. ~/.local/bin/figcraft-agent),
+# ${BASH_SOURCE[0]} is the symlink path. realpath() makes the workspace-root math correct
+# whether or not the wrapper is symlinked.
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 resolve_cli() {
@@ -77,17 +81,20 @@ figcraft-agent <subcommand> [args...]
   commands [--filter REGEX]
         List the full command registry (or filter by regex). For agent planning.
 
-  mcp-start [--bind 127.0.0.1:47800]
-        Start the figcraft-cli MCP server in the background. Writes
-        .figcraft-agent/mcp-{pid,port} under $FIGCRAFT_OUT/agent-state/.
-        Returns one JSON line with the port.
+  mcp-start
+        Run the headless figcraft-cli MCP server in the foreground (stdio).
+        The calling agent drives it via stdin/stdout; this wrapper does NOT
+        background it (the server needs an active client on stdin). Use
+        `mcp-stop` only if the previous `mcp-start` left a stray process;
+        under normal foreground use there is nothing to stop.
 
   mcp-attach <port>
-        Verify a running figcraft app's MCP port is reachable. Returns
-        one JSON line { ok: bool, port: int, reason: string? }.
+        Verify a running figcraft app's control channel port is reachable.
+        The desktop app exposes a loopback control channel (separate from MCP);
+        this does a cheap TCP probe and returns one JSON line.
 
   mcp-stop
-        Stop the background MCP server started by mcp-start.
+        Stop the headless MCP server started by mcp-start.
 
 Environment:
   FIGCRAFT_OUT   Output directory (default $HOME/Pictures/figcraft)
@@ -175,43 +182,11 @@ agent_state_dir() {
 }
 
 cmd_mcp_start() {
-  local bind="127.0.0.1:47800"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --bind) bind="$2"; shift 2 ;;
-      *) err "mcp-start: unknown arg: $1"; return 2 ;;
-    esac
-  done
-
-  local state; state="$(agent_state_dir)"
-  mkdir -p "$state"
-
-  # Reuse an already-running MCP server if the pid file is live.
-  if [[ -f "$state/mcp-pid" ]]; then
-    local pid; pid="$(cat "$state/mcp-pid" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      local port; port="$(cat "$state/mcp-port" 2>/dev/null || echo "$bind")"
-      emit "{\"ok\":true,\"reused\":true,\"pid\":$pid,\"port\":\"$port\"}"
-      return 0
-    fi
-  fi
-
-  # Headless MCP. figcraft-cli 0.6.0: `figcraft-cli mcp` runs in the foreground
-  # over stdio by default. We background it and capture the port from --bind.
-  local log="$state/mcp.log"
-  : > "$log"
-  nohup "$FIGCRAFT_CLI" mcp --bind "$bind" >>"$log" 2>&1 &
-  local pid=$!
-  echo "$pid" > "$state/mcp-pid"
-  echo "$bind" > "$state/mcp-port"
-
-  # Best-effort liveness probe: give the server a moment, then check the pid.
-  sleep 0.3
-  if ! kill -0 "$pid" 2>/dev/null; then
-    err "mcp-start: server exited; see $log"
-    return 1
-  fi
-  emit "{\"ok\":true,\"reused\":false,\"pid\":$pid,\"bind\":\"$bind\",\"log\":\"$log\"}"
+  # The headless MCP server (figcraft-cli mcp) is stdio-driven: it reads MCP
+  # requests from stdin and writes responses to stdout. We exec it in the
+  # foreground so the calling agent's stdio is wired straight to the server.
+  # Backgrounding would close stdin and the server would exit immediately.
+  exec "$FIGCRAFT_CLI" mcp
 }
 
 cmd_mcp_attach() {
@@ -227,19 +202,13 @@ cmd_mcp_attach() {
 }
 
 cmd_mcp_stop() {
-  local state; state="$(agent_state_dir)"
-  [[ -f "$state/mcp-pid" ]] || { emit "{\"ok\":true,\"stopped\":false,\"reason\":\"no pid file\"}"; return 0; }
-  local pid; pid="$(cat "$state/mcp-pid" 2>/dev/null || true)"
-  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$state/mcp-pid" "$state/mcp-port"
-    emit "{\"ok\":true,\"stopped\":false,\"reason\":\"not running\"}"
-    return 0
-  fi
-  kill "$pid" 2>/dev/null || true
-  sleep 0.2
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-  rm -f "$state/mcp-pid" "$state/mcp-port"
-  emit "{\"ok\":true,\"stopped\":true,\"pid\":$pid}"
+  # mcp-start runs the server in the foreground under the calling agent's
+  # stdio, so there is no background process for us to stop. This subcommand
+  # remains so existing callers don't break; it is a no-op that explains.
+  cat <<'EOF'
+{"ok":true,"stopped":false,"reason":"mcp-start runs the server in the foreground under the caller's stdio; nothing to stop from here. Ctrl-C the caller, or kill the wrapping process."}
+EOF
+  return 0
 }
 
 main() {

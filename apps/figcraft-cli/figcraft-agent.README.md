@@ -31,16 +31,16 @@ implementation.
 | `export <file.figcraft> --format svg\|pdf\|webp\|jpg [--out-dir DIR]` | Export layers in the chosen format. |
 | `info <file.figcraft>` | Print file info (raw CLI output, parsed by caller). |
 | `commands [--filter REGEX]` | List the full command registry for agent planning. |
-| `mcp-start [--bind 127.0.0.1:47800]` | Start the headless MCP server in the background. |
-| `mcp-attach <port>` | Probe whether a running figcraft app's MCP port is reachable. |
-| `mcp-stop` | Stop the background MCP server started by `mcp-start`. |
+| `mcp-start` | Start the headless MCP server in the background (stdio). |
+| `mcp-attach <port>` | Probe a running figcraft app's control channel port. |
+| `mcp-stop` | Stop the headless MCP server started by `mcp-start`. |
 
 ## Output
 
 - **stdout**: one JSON object per line, machine-parseable.
 - **stderr**: human-readable errors prefixed with `figcraft-agent: `.
 - **File output**: `$FIGCRAFT_OUT` (default `$HOME/Pictures/figcraft`).
-- **MCP state**: `$FIGCRAFT_OUT/agent-state/mcp-{pid,port,log}`.
+- **MCP state**: `$FIGCRAFT_OUT/agent-state/mcp-{pid,log}`.
 
 ## Environment
 
@@ -79,11 +79,11 @@ cargo build --release -p figcraft-cli
 # Render a Ridgeline example to the standard output dir at 2x
 figcraft-agent render /home/mike/Work/KovaForge/figcraft/examples/ridgeline-app.figcraft
 
-# Start the MCP server for a subagent to drive
+# Start the headless MCP server in the background (stdio)
 figcraft-agent mcp-start
-# {"ok":true,"reused":false,"pid":12345,"bind":"127.0.0.1:47800",...}
+# {"ok":true,"reused":false,"pid":12345,"mode":"stdio","log":".../mcp.log"}
 
-# Probe a running app's MCP port
+# Probe a running app's control channel port
 figcraft-agent mcp-attach 47800
 # {"ok":true,"port":47800}
 
